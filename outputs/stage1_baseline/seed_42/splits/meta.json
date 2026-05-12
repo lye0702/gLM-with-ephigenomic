@@ -1,0 +1,8 @@
+{
+  "seed": 42,
+  "benign_seed": 42,
+  "train_size": 127791,
+  "val_size": 15975,
+  "test_size": 15974,
+  "n_total": 159740
+}
