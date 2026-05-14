@@ -140,8 +140,21 @@ def run_train(cfg, train_df, val_df, test_df, model, device, seed, resume=False)
         print(f"\n  Epoch {epoch:02d} | Loss={avg_l:.4f} | Val Macro-AUPRC={macro:.4f}")
         print_metrics(val_m, prefix="  ")
 
-        # 결과 기록
-        history.append({"epoch": epoch, "loss": avg_l, "val_macro_auprc": macro})
+        # CSV에 저장할 데이터 구성
+        row = {
+            "epoch": epoch,
+            "loss": round(avg_l, 4),
+            "val_macro_auprc": macro
+        }
+
+        for tname in cfg.TISSUE_MAP.values():
+            if tname in val_m:
+                row[f"{tname}_auprc"] = val_m[tname]["auprc"]
+                row[f"{tname}_precision"] = val_m[tname]["precision"]
+                row[f"{tname}_recall"] = val_m[tname]["recall"]
+                row[f"{tname}_f1"] = val_m[tname]["f1"]
+
+        history.append(row)  # 리스트에 추가
 
         # --- [CHECKPOINT] 매 에폭 종료 시 상태 저장 ---
         checkpoint_data = {
