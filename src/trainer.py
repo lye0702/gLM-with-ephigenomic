@@ -32,10 +32,20 @@ def run_inference(model, loader, device, fp16):
     return np.array(all_labels), np.array(all_probs), np.array(all_tissues)
 
 
-def run_train(cfg, train_df, val_df, model, device, seed, resume=False):
+def run_train(cfg, train_df, val_df, test_df, model, device, seed, resume=False):
     """학습 루프 (체크포인트 저장 및 재개 기능 포함)"""
     out_dir = Path(cfg.OUTPUT_DIR) / f"seed_{seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- splits 폴더 및 인덱스 저장 ---
+    split_dir = out_dir / "splits"
+    split_dir.mkdir(parents=True, exist_ok=True)
+
+    # 훈련 시에 사용한 검증/테스트 데이터의 원본 인덱스를 저장
+    if not (split_dir / "val_orig_idx.npy").exists():
+        np.save(str(split_dir / "val_orig_idx.npy"), val_df["_orig_idx"].values)
+        np.save(str(split_dir / "test_orig_idx.npy"), test_df["_orig_idx"].values)
+        print(f"  💾 {seed}번 시드 데이터 인덱스(splits) 저장 완료")
 
     # 1. 데이터 로더 준비
     tokenizer = AutoTokenizer.from_pretrained(cfg.MODEL_NAME, trust_remote_code=True)
@@ -166,3 +176,39 @@ def run_train(cfg, train_df, val_df, model, device, seed, resume=False):
 
     # 최종 결과 리포트 저장
     pd.DataFrame(history).to_csv(out_dir / "training_history.csv", index=False)
+
+
+def run_eval(cfg, eval_df, model, device, seed, split="val"):
+    """저장된 베스트 모델을 로드하여 평가만 수행하는 함수"""
+    out_dir = Path(cfg.OUTPUT_DIR) / f"seed_{seed}"
+    ckpt_path = out_dir / "best_model.pt"
+
+    if not ckpt_path.exists():
+        print(f"  ❌ 에러: 저장된 모델이 없습니다. ({ckpt_path})")
+        print("     먼저 train 모드로 학습을 완료해 주세요.")
+        return None
+
+    # 모델 가중치 로드
+    print(f"  🔄 베스트 모델 로드 중: {ckpt_path}")
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(checkpoint['model_state'])
+    model.to(device)
+
+    # 토크나이저 및 로더 준비
+    from src.dataset import VariantDataset, make_loader
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(cfg.MODEL_NAME, trust_remote_code=True)
+    eval_ds = VariantDataset(eval_df, tokenizer, cfg.MAX_LENGTH)
+    eval_loader = make_loader(eval_ds, cfg.BATCH_SIZE * 2, num_workers=cfg.NUM_WORKERS)
+
+    # 추론 및 메트릭 계산
+    labels, probs, tissues = run_inference(model, eval_loader, device, cfg.FP16)
+    metrics = compute_metrics(labels, probs, tissues, cfg)
+
+    print(f"\n[{split.upper()} 결과 - Seed {seed}]")
+    print_metrics(metrics, prefix="  ")
+
+    # 예측 결과 저장
+    save_predictions(labels, probs, tissues, out_dir / f"{split}_predictions.csv")
+    return metrics
