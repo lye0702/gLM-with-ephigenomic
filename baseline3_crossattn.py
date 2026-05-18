@@ -2,30 +2,24 @@
 =======================================================================
 Stage 3 Baseline: DNABERT-2 + Epigenomic Cross-Attention Fusion
 
-■ 데이터 구조 (실제 npz 포맷 기준)
-  signals_liver_zscore.npz  → keys: chrom, pos, ref, alt, label, tissue_id,
-                                     sequence, h3k27ac(N,1025), dnase(N,1025)
-  signals_heart_zscore.npz
-  signals_brain_zscore.npz
-  signals_liver_benign_zscore.npz   (benign 샘플 — 同 구조)
-  signals_heart_benign_zscore.npz
-  signals_brain_benign_zscore.npz
+■ 핵심 수정사항 (버그 수정)
+  - benign tissue_id를 원래 조직(0/1/2)으로 유지 (BENIGN_TID=3 제거)
+  - benign은 label=0으로만 구분
+  - compute_metrics: benign_msk를 tissue_id가 아닌 label==0 기준으로 변경
+  - _load_npz: tissue_id 문자열→정수 변환 처리 유지
 
-  h3k27ac / dnase 각각 (N, 1025) → 앞 1024열만 사용 → stack → (N, 2, 1024)
-  (1025번째 열은 미사용 예비 열)
-
-■ 모델 파이프라인
-  DNA seq (str)          → DNABERT-2               → [B, L, 768]
-  epi signal (N,2,1024)  → 1D CNN (EpiEncoder)     → [B, L, epi_hidden]
-                          → Cross-Attention Fusion  → [B, L, 768]
-  tissue_id              → Tissue Embedding (add)   → [B, L, 768]
-                          → Masked Mean Pool + MLP  → [B, 1]
+■ 데이터 구조
+  signals_liver_zscore.npz        → pathogenic (label=1, tissue_id=0)
+  signals_heart_zscore.npz        → pathogenic (label=1, tissue_id=1)
+  signals_brain_zscore.npz        → pathogenic (label=1, tissue_id=2)
+  signals_benign_liver_zscore.npz → benign     (label=0, tissue_id=0)
+  signals_benign_heart_zscore.npz → benign     (label=0, tissue_id=1)
+  signals_benign_brain_zscore.npz → benign     (label=0, tissue_id=2)
 
 ■ 실행 예시
-  python baseline3_crossattn.py --verify_only
-  python baseline3_crossattn.py --mode all --single_seed 42
-  python baseline3_crossattn.py --mode all --seeds 42 123 456
-  python baseline3_crossattn.py --mode train --epi_dir /path/to/npz
+  python baseline3_crossattn.py --verify_only --epi_dir epigenomic_signals
+  python baseline3_crossattn.py --mode all --single_seed 42 --epi_dir epigenomic_signals
+  python baseline3_crossattn.py --mode all --seeds 42 123 456 --epi_dir epigenomic_signals
 =======================================================================
 """
 
@@ -59,54 +53,51 @@ warnings.filterwarnings("ignore")
 
 class Config:
     # ── npz 파일 경로 설정 ────────────────────────────────────────────
-    EPI_DIR = "epigenomic_signals"          # npz 파일들이 있는 폴더
+    EPI_DIR = "epigenomic_signals"
 
-    # pathogenic npz
     EPI_LIVER_FILE  = "signals_liver_zscore.npz"
     EPI_HEART_FILE  = "signals_heart_zscore.npz"
     EPI_BRAIN_FILE  = "signals_brain_zscore.npz"
 
-    # benign npz
     EPI_LIVER_BENIGN_FILE = "signals_benign_liver_zscore.npz"
     EPI_HEART_BENIGN_FILE = "signals_benign_heart_zscore.npz"
     EPI_BRAIN_BENIGN_FILE = "signals_benign_brain_zscore.npz"
 
     # ── 신호 차원 설정 ────────────────────────────────────────────────
-    EPI_N_CHANNELS = 2      # h3k27ac + dnase
-    EPI_RAW_LEN    = 1025   # npz 원본 길이
-    EPI_USE_LEN    = 1024   # 앞 1024열만 사용 (마지막 1열 제외)
+    EPI_N_CHANNELS = 2
+    EPI_USE_LEN    = 1024   # 앞 1024열 사용 (1025번째 제외)
 
     # ── tissue 설정 ───────────────────────────────────────────────────
-    # tissue_id: 0=liver, 1=heart, 2=brain (npz의 tissue_id 값 기준)
-    TISSUE_MAP  = {0: "liver", 1: "heart", 2: "brain"}
-    BENIGN_TID  = 3   # benign 샘플에 부여할 tissue_id (학습용)
+    # benign도 동일한 tissue_id(0/1/2) 사용, label=0으로 구분
+    TISSUE_MAP     = {0: "liver", 1: "heart", 2: "brain"}
+    TISSUE_STR_MAP = {"liver": 0, "heart": 1, "brain": 2}
+    N_TISSUES      = 3
 
-    # ── benign 샘플링 설정 ────────────────────────────────────────────
-    BENIGN_RATIO = 3
+    # ── benign 샘플링 ─────────────────────────────────────────────────
+    BENIGN_RATIO = 3   # 조직별 pathogenic 수 × BENIGN_RATIO
     BENIGN_SEED  = 42
 
-    # ── 데이터 분할 비율 ──────────────────────────────────────────────
+    # ── 데이터 분할 ───────────────────────────────────────────────────
     VAL_RATIO  = 0.10
     TEST_RATIO = 0.10
 
-    # ── DNABERT-2 설정 ────────────────────────────────────────────────
+    # ── DNABERT-2 ─────────────────────────────────────────────────────
     MODEL_NAME = "zhihan1996/DNABERT-2-117M"
-    MAX_LENGTH = 256    # DNA 토큰 최대 길이
-    HIDDEN_DIM = 768    # DNABERT-2 출력 차원
+    MAX_LENGTH = 256
+    HIDDEN_DIM = 768
 
-    # ── Epigenomic Encoder (1D CNN) 설정 ─────────────────────────────
-    EPI_HIDDEN  = 128   # CNN 출력 채널 수
-    CNN_KERNEL  = 7
+    # ── Epigenomic Encoder ────────────────────────────────────────────
+    EPI_HIDDEN = 128
+    CNN_KERNEL = 7
 
-    # ── Cross-Attention 설정 ─────────────────────────────────────────
+    # ── Cross-Attention ───────────────────────────────────────────────
     ATTN_HEADS   = 8
     ATTN_DROPOUT = 0.1
 
-    # ── Tissue Embedding 설정 ─────────────────────────────────────────
-    N_TISSUES      = 4   # liver/heart/brain + benign
+    # ── Tissue Embedding ──────────────────────────────────────────────
     TISSUE_EMB_DIM = 768
 
-    # ── 학습 설정 (Baseline1과 동일) ──────────────────────────────────
+    # ── 학습 설정 ─────────────────────────────────────────────────────
     DROPOUT       = 0.1
     BATCH_SIZE    = 8
     GRAD_ACCUM    = 2
@@ -147,31 +138,30 @@ def get_device(fp16: bool):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 3. 데이터 로드: npz → DataFrame + epi 배열
+# 3. 데이터 로드
 # ══════════════════════════════════════════════════════════════════════
 
-def _load_npz(fpath: Path, use_len: int) -> dict:
+def _load_npz(fpath: Path, cfg: Config) -> dict:
     """
     단일 npz 로드.
-    반환: {
-        'sequences' : list[str],
-        'labels'    : np.ndarray (N,) int64,
-        'tissue_ids': np.ndarray (N,) int64,
-        'h3k27ac'   : np.ndarray (N, use_len) float32,
-        'dnase'     : np.ndarray (N, use_len) float32,
-    }
+    tissue_id가 문자열('liver')이어도 정수(0)로 자동 변환.
     """
     data = np.load(str(fpath), allow_pickle=True)
-    sequences  = data["sequence"].tolist()
-    labels     = data["label"].astype(np.int64)
-    tissue_id_raw = data["tissue_id"]
-    tissue_map = {"liver": 0, "heart": 1, "brain": 2}
-    if tissue_id_raw.dtype.kind in ("U", "S", "O"):  # 문자열인 경우
-        tissue_ids = np.array([tissue_map[t] for t in tissue_id_raw], dtype=np.int64)
+
+    sequences = data["sequence"].tolist()
+    labels    = data["label"].astype(np.int64)
+
+    # tissue_id: 문자열/정수 모두 처리
+    tid_raw = data["tissue_id"]
+    if tid_raw.dtype.kind in ("U", "S", "O"):
+        tissue_ids = np.array(
+            [cfg.TISSUE_STR_MAP[str(t)] for t in tid_raw], dtype=np.int64)
     else:
-        tissue_ids = tissue_id_raw.astype(np.int64)
-    h3k27ac    = data["h3k27ac"][:, :use_len].astype(np.float32)
-    dnase      = data["dnase"][:, :use_len].astype(np.float32)
+        tissue_ids = tid_raw.astype(np.int64)
+
+    h3k27ac = data["h3k27ac"][:, :cfg.EPI_USE_LEN].astype(np.float32)
+    dnase   = data["dnase"][:, :cfg.EPI_USE_LEN].astype(np.float32)
+
     return {
         "sequences":  sequences,
         "labels":     labels,
@@ -183,24 +173,26 @@ def _load_npz(fpath: Path, use_len: int) -> dict:
 
 def load_all_data(cfg: Config) -> tuple:
     """
-    pathogenic 3개 + benign 3개 npz를 모두 로드.
+    pathogenic 3개 + benign 3개 npz 로드.
+    benign은 조직별로 pathogenic 수 × BENIGN_RATIO 만큼 샘플링.
+    tissue_id: pathogenic/benign 동일(0/1/2), label(0/1)로 구분.
 
     반환:
-        df          : pd.DataFrame  (sequence, label, tissue_id, _orig_idx)
-        h3k_arr     : np.ndarray    (N_total, EPI_USE_LEN)  — df 행과 1:1 대응
-        dnase_arr   : np.ndarray    (N_total, EPI_USE_LEN)
+        df        : pd.DataFrame (sequence, label, tissue_id, _orig_idx)
+        h3k_arr   : np.ndarray (N_total, EPI_USE_LEN)
+        dnase_arr : np.ndarray (N_total, EPI_USE_LEN)
     """
     epi_dir = Path(cfg.EPI_DIR)
 
     patho_files = [
-        epi_dir / cfg.EPI_LIVER_FILE,
-        epi_dir / cfg.EPI_HEART_FILE,
-        epi_dir / cfg.EPI_BRAIN_FILE,
+        (epi_dir / cfg.EPI_LIVER_FILE,        0),
+        (epi_dir / cfg.EPI_HEART_FILE,        1),
+        (epi_dir / cfg.EPI_BRAIN_FILE,        2),
     ]
     benign_files = [
-        epi_dir / cfg.EPI_LIVER_BENIGN_FILE,
-        epi_dir / cfg.EPI_HEART_BENIGN_FILE,
-        epi_dir / cfg.EPI_BRAIN_BENIGN_FILE,
+        (epi_dir / cfg.EPI_LIVER_BENIGN_FILE, 0),
+        (epi_dir / cfg.EPI_HEART_BENIGN_FILE, 1),
+        (epi_dir / cfg.EPI_BRAIN_BENIGN_FILE, 2),
     ]
 
     all_seqs, all_labels, all_tids = [], [], []
@@ -208,54 +200,41 @@ def load_all_data(cfg: Config) -> tuple:
 
     # ── Pathogenic 로드 ───────────────────────────────────────────────
     print("\n─── Pathogenic npz 로드 ───────────────────────────────")
-    for fpath in patho_files:
+    n_patho_per_tissue = {}
+    for fpath, tid in patho_files:
         if not fpath.exists():
             raise FileNotFoundError(f"파일 없음: {fpath}")
-        d = _load_npz(fpath, cfg.EPI_USE_LEN)
+        d = _load_npz(fpath, cfg)
         n = len(d["sequences"])
-        print(f"  {fpath.name}: {n:,} rows  "
-              f"(tissue_id={np.unique(d['tissue_ids']).tolist()})")
+        n_patho_per_tissue[tid] = n
+        print(f"  {fpath.name}: {n:,} rows  (tissue_id={tid}, label=1)")
         all_seqs.extend(d["sequences"])
         all_labels.append(d["labels"])
         all_tids.append(d["tissue_ids"])
         all_h3k.append(d["h3k27ac"])
         all_dnase.append(d["dnase"])
 
-    n_patho = sum(len(x) for x in all_labels)
-
-    # ── Benign 로드 & 샘플링 ──────────────────────────────────────────
-    n_benign_target = n_patho * cfg.BENIGN_RATIO
+    # ── Benign 로드 & 조직별 샘플링 ──────────────────────────────────
+    print(f"\n─── Benign npz 로드 (BENIGN_RATIO={cfg.BENIGN_RATIO}) ──")
     rng = np.random.RandomState(cfg.BENIGN_SEED)
 
-    print(f"\n─── Benign npz 로드 (target={n_benign_target:,}) ────────")
-    raw_benign = []
-    for fpath in benign_files:
+    for fpath, tid in benign_files:
         if not fpath.exists():
             raise FileNotFoundError(f"파일 없음: {fpath}")
-        d = _load_npz(fpath, cfg.EPI_USE_LEN)
-        print(f"  {fpath.name}: {len(d['sequences']):,} rows")
-        raw_benign.append(d)
+        d       = _load_npz(fpath, cfg)
+        n_total  = len(d["sequences"])
+        n_target = n_patho_per_tissue[tid] * cfg.BENIGN_RATIO
+        n_sample = min(n_target, n_total)
+        chosen   = rng.choice(n_total, size=n_sample, replace=False)
 
-    # 전체 benign을 합쳐 n_benign_target 만큼 랜덤 샘플링
-    total_benign_n = sum(len(d["sequences"]) for d in raw_benign)
-    cum_lens = np.cumsum([0] + [len(d["sequences"]) for d in raw_benign])
-    sample_n = min(n_benign_target, total_benign_n)
-    chosen   = np.sort(rng.choice(total_benign_n, size=sample_n, replace=False))
+        print(f"  {fpath.name}: {n_total:,} → {n_sample:,} 샘플링 "
+              f"(tissue_id={tid}, label=0)")
 
-    for fi, d in enumerate(raw_benign):
-        start, end = cum_lens[fi], cum_lens[fi + 1]
-        mask      = (chosen >= start) & (chosen < end)
-        local_idx = chosen[mask] - start
-        if len(local_idx) == 0:
-            continue
-        # benign tissue_id → cfg.BENIGN_TID(=3), label → 0
-        all_seqs.extend([d["sequences"][i] for i in local_idx])
-        all_labels.append(np.zeros(len(local_idx), dtype=np.int64))
-        all_tids.append(np.full(len(local_idx), cfg.BENIGN_TID, dtype=np.int64))
-        all_h3k.append(d["h3k27ac"][local_idx])
-        all_dnase.append(d["dnase"][local_idx])
-
-    print(f"  Benign 샘플링 완료: {sample_n:,} rows")
+        all_seqs.extend([d["sequences"][i] for i in chosen])
+        all_labels.append(np.zeros(n_sample, dtype=np.int64))       # label=0
+        all_tids.append(np.full(n_sample, tid, dtype=np.int64))     # tissue_id 유지
+        all_h3k.append(d["h3k27ac"][chosen])
+        all_dnase.append(d["dnase"][chosen])
 
     # ── 전체 합치기 ───────────────────────────────────────────────────
     labels_arr = np.concatenate(all_labels,  axis=0)
@@ -273,17 +252,20 @@ def load_all_data(cfg: Config) -> tuple:
     seq_len_s = df["sequence"].str.len()
     keep_mask = (seq_len_s >= 600) & (seq_len_s <= 1100)
     keep_idx  = np.where(keep_mask)[0]
-
     df        = df[keep_mask].reset_index(drop=True)
     h3k_arr   = h3k_arr[keep_idx]
     dnase_arr = dnase_arr[keep_idx]
-
     df["_orig_idx"] = np.arange(len(df))
 
     print(f"\n  총 샘플:    {len(df):,}")
     print(f"  Label  분포: {dict(df['label'].value_counts().sort_index())}")
     print(f"  Tissue 분포: {dict(df['tissue_id'].value_counts().sort_index())}")
-    print(f"  h3k27ac shape: {h3k_arr.shape},  dnase shape: {dnase_arr.shape}")
+    print(f"  조직별 pos/neg:")
+    for tid, tname in cfg.TISSUE_MAP.items():
+        sub = df[df["tissue_id"] == tid]
+        pos = int((sub["label"] == 1).sum())
+        neg = int((sub["label"] == 0).sum())
+        print(f"    {tname:5s}: pos={pos:,}  neg={neg:,}")
 
     return df, h3k_arr, dnase_arr
 
@@ -319,22 +301,15 @@ def stratified_split(df, cfg, seed):
 # ══════════════════════════════════════════════════════════════════════
 
 class VariantEpiDataset(Dataset):
-    """
-    각 샘플마다 DNA 서열 토큰 + 후성유전학 신호 (2채널) 반환.
-    epi 신호는 df._orig_idx 를 통해 전체 배열(h3k_arr, dnase_arr)에서 인덱싱.
-    """
-
-    def __init__(self, df: pd.DataFrame, tokenizer,
-                 h3k_arr: np.ndarray, dnase_arr: np.ndarray,
-                 cfg: Config):
+    def __init__(self, df, tokenizer, h3k_arr, dnase_arr, cfg):
         self.sequences  = df["sequence"].tolist()
         self.labels     = df["label"].tolist()
         self.tissue_ids = df["tissue_id"].tolist()
         self.orig_idxs  = df["_orig_idx"].tolist()
         self.tokenizer  = tokenizer
         self.max_length = cfg.MAX_LENGTH
-        self.h3k_arr    = h3k_arr       # (N_total, 1024)
-        self.dnase_arr  = dnase_arr     # (N_total, 1024)
+        self.h3k_arr    = h3k_arr
+        self.dnase_arr  = dnase_arr
 
     def __len__(self):
         return len(self.sequences)
@@ -348,10 +323,9 @@ class VariantEpiDataset(Dataset):
             return_tensors="pt",
         )
         oi  = self.orig_idxs[idx]
-        # (2, 1024): row0=h3k27ac, row1=dnase
         epi = torch.from_numpy(
             np.stack([self.h3k_arr[oi], self.dnase_arr[oi]], axis=0)
-        ).float()
+        ).float()   # (2, 1024)
 
         return {
             "input_ids":      enc["input_ids"].squeeze(0),
@@ -362,7 +336,7 @@ class VariantEpiDataset(Dataset):
         }
 
 
-def make_weighted_sampler(df: pd.DataFrame) -> WeightedRandomSampler:
+def make_weighted_sampler(df):
     labels  = df["label"].values
     counts  = np.bincount(labels)
     weights = torch.tensor(1.0 / counts[labels], dtype=torch.double)
@@ -370,10 +344,9 @@ def make_weighted_sampler(df: pd.DataFrame) -> WeightedRandomSampler:
 
 
 def _make_loader(ds, batch_size, shuffle=False, sampler=None, num_workers=4):
-    use_pin = torch.cuda.is_available()
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
                       sampler=sampler, num_workers=num_workers,
-                      pin_memory=use_pin)
+                      pin_memory=torch.cuda.is_available())
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -381,13 +354,9 @@ def _make_loader(ds, batch_size, shuffle=False, sampler=None, num_workers=4):
 # ══════════════════════════════════════════════════════════════════════
 
 class EpigenomicEncoder(nn.Module):
-    """
-    1D CNN: (B, 2, 1024) → (B, MAX_LENGTH, epi_hidden)
-    AdaptiveAvgPool1d 로 DNA 토큰 수(MAX_LENGTH)에 맞게 길이 조정.
-    """
+    """1D CNN: (B, 2, 1024) → (B, MAX_LENGTH, epi_hidden)"""
 
-    def __init__(self, in_channels: int = 2, hidden: int = 128,
-                 kernel: int = 7, target_len: int = 256):
+    def __init__(self, in_channels=2, hidden=128, kernel=7, target_len=256):
         super().__init__()
         self.cnn = nn.Sequential(
             nn.Conv1d(in_channels, hidden, kernel, padding=kernel // 2),
@@ -400,22 +369,17 @@ class EpigenomicEncoder(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(target_len)
 
     def forward(self, x):
-        # x: (B, 2, 1024)
         out = self.cnn(x)           # (B, hidden, 1024)
         out = self.pool(out)        # (B, hidden, target_len)
         return out.permute(0, 2, 1) # (B, target_len, hidden)
 
 
 class CrossAttentionFusion(nn.Module):
-    """
-    DNA(Query) × Epi(Key, Value) Cross-Attention + residual + LayerNorm.
-    연구계획서 명세: DNA 서열 정보를 Query, 후성유전 정보를 Key/Value.
-    """
+    """DNA(Query) × Epi(Key, Value) Cross-Attention + residual + LayerNorm"""
 
-    def __init__(self, dna_dim: int = 768, epi_dim: int = 128,
-                 n_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, dna_dim=768, epi_dim=128, n_heads=8, dropout=0.1):
         super().__init__()
-        assert dna_dim % n_heads == 0, "dna_dim must be divisible by n_heads"
+        assert dna_dim % n_heads == 0
         self.n_heads  = n_heads
         self.dna_dim  = dna_dim
         self.head_dim = dna_dim // n_heads
@@ -427,7 +391,7 @@ class CrossAttentionFusion(nn.Module):
         self.drop     = nn.Dropout(dropout)
         self.norm     = nn.LayerNorm(dna_dim)
 
-    def forward(self, dna: torch.Tensor, epi: torch.Tensor) -> torch.Tensor:
+    def forward(self, dna, epi):
         B, L, _ = dna.shape
 
         def split_heads(x):
@@ -437,51 +401,35 @@ class CrossAttentionFusion(nn.Module):
         K = split_heads(self.k_proj(epi))
         V = split_heads(self.v_proj(epi))
 
-        attn = self.drop(
-            F.softmax(
-                torch.matmul(Q, K.transpose(-2, -1)) * (self.head_dim ** -0.5),
-                dim=-1)
-        )
+        attn = self.drop(F.softmax(
+            torch.matmul(Q, K.transpose(-2, -1)) * (self.head_dim ** -0.5),
+            dim=-1))
         out = torch.matmul(attn, V)
         out = out.transpose(1, 2).contiguous().view(B, L, self.dna_dim)
-        return self.norm(dna + self.out_proj(out))   # residual + LayerNorm
+        return self.norm(dna + self.out_proj(out))
 
 
 class DNABERT2CrossAttn(nn.Module):
-    """
-    Stage 3 전체 모델.
-    forward(input_ids, attention_mask, epi_signal, tissue_id) → logits (B,)
-    """
-
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg):
         super().__init__()
-        # DNA Encoder
         bert_cfg     = BertConfig.from_pretrained(cfg.MODEL_NAME)
         self.dna_enc = AutoModel.from_pretrained(
             cfg.MODEL_NAME, trust_remote_code=True, config=bert_cfg)
-
-        # Epigenomic Encoder
         self.epi_enc = EpigenomicEncoder(
             in_channels=cfg.EPI_N_CHANNELS,
             hidden=cfg.EPI_HIDDEN,
             kernel=cfg.CNN_KERNEL,
             target_len=cfg.MAX_LENGTH,
         )
-
-        # Cross-Attention Fusion
-        self.fusion  = CrossAttentionFusion(
+        self.fusion = CrossAttentionFusion(
             dna_dim=cfg.HIDDEN_DIM,
             epi_dim=cfg.EPI_HIDDEN,
             n_heads=cfg.ATTN_HEADS,
             dropout=cfg.ATTN_DROPOUT,
         )
-
-        # Tissue Embedding
         self.tissue_emb  = nn.Embedding(cfg.N_TISSUES, cfg.TISSUE_EMB_DIM)
         self.tissue_norm = nn.LayerNorm(cfg.TISSUE_EMB_DIM)
-
-        # MLP Classifier
-        self.classifier = nn.Sequential(
+        self.classifier  = nn.Sequential(
             nn.Dropout(cfg.DROPOUT),
             nn.Linear(cfg.HIDDEN_DIM, 256), nn.GELU(),
             nn.Dropout(cfg.DROPOUT),
@@ -494,24 +442,14 @@ class DNABERT2CrossAttn(nn.Module):
         return (h * m).sum(1) / m.sum(1).clamp(min=1e-9)
 
     def forward(self, input_ids, attention_mask, epi_signal, tissue_id):
-        # 1) DNA Encoder → token repr
-        dna_repr = self.dna_enc(
-            input_ids=input_ids,
-            attention_mask=attention_mask)[0]       # (B, L, 768)
-
-        # 2) Epigenomic Encoder
-        epi_repr = self.epi_enc(epi_signal)         # (B, L, epi_hidden)
-
-        # 3) Cross-Attention Fusion (DNA=Q, Epi=K/V)
-        fused = self.fusion(dna_repr, epi_repr)     # (B, L, 768)
-
-        # 4) Tissue Embedding (broadcast)
-        t     = self.tissue_norm(self.tissue_emb(tissue_id))  # (B, 768)
-        fused = fused + t.unsqueeze(1)              # (B, L, 768)
-
-        # 5) Masked Mean Pool → MLP
-        pooled = self._masked_mean_pool(fused, attention_mask)  # (B, 768)
-        return self.classifier(pooled).squeeze(-1)              # (B,)
+        dna_repr = self.dna_enc(input_ids=input_ids,
+                                attention_mask=attention_mask)[0]   # (B, L, 768)
+        epi_repr = self.epi_enc(epi_signal)                         # (B, L, epi_hidden)
+        fused    = self.fusion(dna_repr, epi_repr)                  # (B, L, 768)
+        t        = self.tissue_norm(self.tissue_emb(tissue_id))     # (B, 768)
+        fused    = fused + t.unsqueeze(1)                           # (B, L, 768)
+        pooled   = self._masked_mean_pool(fused, attention_mask)    # (B, 768)
+        return self.classifier(pooled).squeeze(-1)                  # (B,)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -542,18 +480,28 @@ def run_inference(model, loader, device, fp16):
             np.array(all_tissues, dtype=np.int32))
 
 
-def compute_metrics(labels, probs, tissues, cfg: Config) -> dict:
+def compute_metrics(labels, probs, tissues, cfg) -> dict:
+    """
+    조직별 평가:
+      - 해당 조직의 pathogenic(label=1)
+      - 전체 benign(label=0, tissue_id 무관)
+    → benign은 label 기준으로 구분 (tissue_id 기준 X)
+    """
     metrics, auprc_list = {}, []
-    benign_msk = (tissues == cfg.BENIGN_TID)
+    benign_msk = (labels == 0)   # ← label 기준으로 benign 구분
 
     for tid, tname in cfg.TISSUE_MAP.items():
-        msk = (tissues == tid) | benign_msk
+        patho_msk = (tissues == tid) & (labels == 1)
+        msk       = patho_msk | benign_msk
+
         if msk.sum() == 0 or labels[msk].sum() == 0:
             print(f"  Warning: {tname} 평가 데이터 없음")
             continue
+
         l, p  = labels[msk], probs[msk]
         preds = (p >= 0.5).astype(int)
         auprc = average_precision_score(l, p)
+
         metrics[tname] = {
             "auprc":        float(round(auprc, 4)),
             "precision":    float(round(precision_score(l, preds, zero_division=0), 4)),
@@ -568,7 +516,7 @@ def compute_metrics(labels, probs, tissues, cfg: Config) -> dict:
     return metrics
 
 
-def print_metrics(metrics: dict, prefix: str = ""):
+def print_metrics(metrics, prefix=""):
     print(f"{prefix}Macro-AUPRC: {metrics['macro_auprc']:.4f}")
     for k, v in metrics.items():
         if k == "macro_auprc":
@@ -578,7 +526,7 @@ def print_metrics(metrics: dict, prefix: str = ""):
               f"(pos={v['n_pathogenic']}, neg={v['n_benign']})")
 
 
-def _save_predictions(labels, probs, tissues, path: Path):
+def _save_predictions(labels, probs, tissues, path):
     pd.DataFrame({
         "label":     labels.tolist(),
         "prob":      probs.tolist(),
@@ -610,9 +558,12 @@ def run_train(cfg, df, h3k_arr, dnase_arr, seed):
     with open(split_dir / "meta.json", "w") as f:
         json.dump({"seed": seed, "benign_seed": cfg.BENIGN_SEED,
                    "train": len(train_df), "val": len(val_df),
-                   "test":  len(test_df),  "total": len(df)},
-                  f, indent=2)
+                   "test":  len(test_df),  "total": len(df)}, f, indent=2)
+
+    n_pos = int((train_df["label"] == 1).sum())
+    n_neg = int((train_df["label"] == 0).sum())
     print(f"  Train={len(train_df):,} | Val={len(val_df):,} | Test={len(test_df):,}")
+    print(f"  Train pos(patho)={n_pos:,} | neg(benign)={n_neg:,}")
 
     # ── Tokenizer & DataLoaders ───────────────────────────────────────
     print(f"\n  Tokenizer 로드: {cfg.MODEL_NAME}")
@@ -631,7 +582,7 @@ def run_train(cfg, df, h3k_arr, dnase_arr, seed):
     n_p   = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  학습 파라미터: {n_p/1e6:.1f}M")
 
-    # ── Optimizer (차등 학습률: backbone vs 신규 모듈) ────────────────
+    # ── Optimizer (차등 학습률) ───────────────────────────────────────
     optimizer = torch.optim.AdamW([
         {"params": model.dna_enc.parameters(),     "lr": cfg.LR_BACKBONE},
         {"params": model.epi_enc.parameters(),     "lr": cfg.LR_HEAD},
@@ -645,9 +596,7 @@ def run_train(cfg, df, h3k_arr, dnase_arr, seed):
     warmup_steps = int(total_steps * cfg.WARMUP_RATIO)
     scheduler    = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    # ── Loss (class-weighted BCE) ─────────────────────────────────────
-    n_pos = int((train_df["label"] == 1).sum())
-    n_neg = int((train_df["label"] == 0).sum())
+    # ── Loss ──────────────────────────────────────────────────────────
     pos_w = torch.tensor(n_neg / n_pos, dtype=torch.float).to(device)
     crit  = nn.BCEWithLogitsLoss(pos_weight=pos_w)
     print(f"  pos_weight={pos_w.item():.2f}  (neg={n_neg:,} / pos={n_pos:,})")
@@ -688,7 +637,6 @@ def run_train(cfg, df, h3k_arr, dnase_arr, seed):
 
             pbar.set_postfix({"loss": f"{epoch_loss/(step+1):.4f}"})
 
-        # Validation
         val_lbl, val_prob, val_tid = run_inference(model, val_loader, device, use_fp16)
         val_m  = compute_metrics(val_lbl, val_prob, val_tid, cfg)
         macro  = val_m["macro_auprc"]
@@ -706,14 +654,12 @@ def run_train(cfg, df, h3k_arr, dnase_arr, seed):
         if macro > best_macro:
             best_macro, patience_cnt = macro, 0
             torch.save({
-                "epoch":       epoch,
-                "model_state": model.state_dict(),
+                "epoch": epoch, "model_state": model.state_dict(),
                 "val_metrics": val_m,
-                "config": {"model_name":  cfg.MODEL_NAME,
-                           "max_length":  cfg.MAX_LENGTH,
-                           "epi_hidden":  cfg.EPI_HIDDEN,
-                           "attn_heads":  cfg.ATTN_HEADS,
-                           "epi_use_len": cfg.EPI_USE_LEN}
+                "config": {"model_name": cfg.MODEL_NAME,
+                           "max_length": cfg.MAX_LENGTH,
+                           "epi_hidden": cfg.EPI_HIDDEN,
+                           "attn_heads": cfg.ATTN_HEADS}
             }, out_dir / "best_model.pt")
             print(f"  ✅ Best 모델 저장 (Macro-AUPRC={best_macro:.4f})")
         else:
@@ -745,19 +691,16 @@ def run_eval(cfg, df, h3k_arr, dnase_arr, seed, split="test"):
     print(f"  [{split.upper()}] Stage3 | Seed={seed}")
     print('═'*62)
 
-    # ── Split 복원 ────────────────────────────────────────────────────
     idx_path = split_dir / f"{split}_orig_idx.npy"
     if not idx_path.exists():
         raise FileNotFoundError(
-            f"  ❌ {idx_path} 없음. 먼저 train을 실행하세요:\n"
-            f"  python baseline3_crossattn.py --mode train --single_seed {seed}")
+            f"  ❌ {idx_path} 없음. 먼저 train을 실행하세요.")
     orig_idx = np.load(str(idx_path))
     eval_df  = df.iloc[orig_idx].reset_index(drop=True)
-    print(f"  {split} 샘플: {len(eval_df):,}")
-    print(f"  Label  분포: {dict(eval_df['label'].value_counts().sort_index())}")
-    print(f"  Tissue 분포: {dict(eval_df['tissue_id'].value_counts().sort_index())}")
+    n_pos    = int((eval_df["label"] == 1).sum())
+    n_neg    = int((eval_df["label"] == 0).sum())
+    print(f"  {split} 샘플: {len(eval_df):,}  (pos={n_pos:,}, neg={n_neg:,})")
 
-    # ── 모델 로드 ─────────────────────────────────────────────────────
     ckpt_path = out_dir / "best_model.pt"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"  ❌ {ckpt_path} 없음.")
@@ -767,13 +710,11 @@ def run_eval(cfg, df, h3k_arr, dnase_arr, seed, split="test"):
     model = model.to(device)
     print(f"  모델 로드 완료 (Best epoch={ckpt['epoch']})")
 
-    # ── DataLoader ────────────────────────────────────────────────────
     tokenizer   = AutoTokenizer.from_pretrained(cfg.MODEL_NAME, trust_remote_code=True)
     eval_ds     = VariantEpiDataset(eval_df, tokenizer, h3k_arr, dnase_arr, cfg)
     eval_loader = _make_loader(eval_ds, cfg.BATCH_SIZE * 2,
                                num_workers=cfg.NUM_WORKERS)
 
-    # ── 추론 & 메트릭 ─────────────────────────────────────────────────
     labels, probs, tissues = run_inference(model, eval_loader, device, use_fp16)
     metrics = compute_metrics(labels, probs, tissues, cfg)
 
@@ -795,23 +736,18 @@ def run_eval(cfg, df, h3k_arr, dnase_arr, seed, split="test"):
 def parse_args():
     p = argparse.ArgumentParser(
         description="Stage 3: DNABERT-2 + Epigenomic Cross-Attention")
-    p.add_argument("--mode", choices=["train", "val", "test", "all"],
-                   default="all")
-    p.add_argument("--epi_dir",      default=Config.EPI_DIR,
-                   help="npz 파일들이 있는 폴더 경로")
+    p.add_argument("--mode", choices=["train", "val", "test", "all"], default="all")
+    p.add_argument("--epi_dir",      default=Config.EPI_DIR)
     p.add_argument("--output_dir",   default=Config.OUTPUT_DIR)
     p.add_argument("--seeds",        nargs="+", type=int, default=Config.SEEDS)
     p.add_argument("--single_seed",  type=int,  default=None)
     p.add_argument("--batch_size",   type=int,  default=Config.BATCH_SIZE)
     p.add_argument("--num_epochs",   type=int,  default=Config.NUM_EPOCHS)
     p.add_argument("--benign_ratio", type=int,  default=Config.BENIGN_RATIO)
-    p.add_argument("--epi_hidden",   type=int,  default=Config.EPI_HIDDEN,
-                   help="Epigenomic CNN 출력 채널 수 (기본 128)")
-    p.add_argument("--attn_heads",   type=int,  default=Config.ATTN_HEADS,
-                   help="Cross-Attention 헤드 수 (기본 8)")
+    p.add_argument("--epi_hidden",   type=int,  default=Config.EPI_HIDDEN)
+    p.add_argument("--attn_heads",   type=int,  default=Config.ATTN_HEADS)
     p.add_argument("--no_fp16",      action="store_true")
-    p.add_argument("--verify_only",  action="store_true",
-                   help="npz 로드 및 shape 확인만 하고 종료")
+    p.add_argument("--verify_only",  action="store_true")
     return p.parse_args()
 
 
@@ -831,7 +767,6 @@ def main():
 
     Path(cfg.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-    # ── 데이터 전체 로드 ──────────────────────────────────────────────
     set_seed(cfg.BENIGN_SEED)
     df, h3k_arr, dnase_arr = load_all_data(cfg)
 
@@ -839,24 +774,18 @@ def main():
         print("\n  verify_only 완료. 종료합니다.")
         return
 
-    # ── 시드별 실행 ───────────────────────────────────────────────────
     all_results = {}
     for seed in cfg.SEEDS:
         results = {}
-
         if args.mode in ("train", "all"):
             _, val_m = run_train(cfg, df, h3k_arr, dnase_arr, seed)
             results["val"] = val_m
-
         if args.mode == "val":
             results["val"] = run_eval(cfg, df, h3k_arr, dnase_arr, seed, "val")
-
         if args.mode in ("test", "all"):
             results["test"] = run_eval(cfg, df, h3k_arr, dnase_arr, seed, "test")
-
         all_results[seed] = results
 
-    # ── 최종 요약 ─────────────────────────────────────────────────────
     if args.mode in ("test", "all") and all_results:
         print("\n" + "═"*62)
         print("  최종 결과 (mean ± std across seeds)")
