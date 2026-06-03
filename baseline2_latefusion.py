@@ -2,616 +2,510 @@
 =======================================================================
 Stage 2 Baseline: DNABERT-2 + Late Fusion (Epigenomic Concatenation)
 
-■ baseline3_crossattn.py 와 다른 점 (단 한 곳)
-  Cross-Attention Fusion  →  Late Fusion (concat + Linear projection)
-  - DNA CLS 토큰 [768] + EpiEncoder 글로벌 평균풀링 [epi_hidden] + Tissue Emb [epi_hidden]
-  - concat → Linear → LayerNorm → MLP → 병원성 확률
+baseline3_crossattn.py 와 다른 점: 모델 구조만 다름
+  Cross-Attention → Late Fusion (CLS + GlobalAvgPool + TissueEmb concat)
 
-■ 데이터 구조 (baseline3 와 동일)
-  signals_liver_zscore.npz / heart / brain
-  signals_liver_benign_zscore.npz / heart / brain
-  keys: chrom, pos, ref, alt, label, tissue_id,
-        sequence, h3k27ac(N,1025), dnase(N,1025)
-
-■ 실행 예시
-  python baseline2_latefusion.py --verify_only
-  python baseline2_latefusion.py --mode all --no_fp16
-  python baseline2_latefusion.py --mode train --epi_dir /path/to/npz --output_dir ./out_latefusion
+baseline3 와 동일하게 맞춘 것:
+  - stratified_split (tissue+label 층화 분할)
+  - splits/ 저장 (val_orig_idx.npy, test_orig_idx.npy, meta.json)
+  - _orig_idx 기반 epi 배열 인덱싱
+  - pos_weight = n_neg / n_pos (동적 계산)
+  - compute_metrics: benign을 label==0 기준으로 구분
+  - 출력 파일 구조 동일
+    best_model.pt / val_metrics.json / test_metrics.json /
+    test_predictions.csv / training_history.csv / splits/
 =======================================================================
 """
-
 import os, json, random, warnings, argparse
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from transformers import (
-    AutoTokenizer, AutoModel,
-    get_linear_schedule_with_warmup,
-)
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from transformers.models.bert.configuration_bert import BertConfig
-from sklearn.metrics import (
-    average_precision_score,
-    precision_score, recall_score, f1_score,
-)
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import average_precision_score, precision_score, recall_score, f1_score
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 1. 설정 (baseline3 와 동일값 유지)
-# ══════════════════════════════════════════════════════════════════════
-class CFG:
-    MODEL_NAME   = "zhihan1996/DNABERT-2-117M"
-    MAX_LENGTH   = 256          # DNABERT-2 토큰 최대 길이
-    EPI_HIDDEN   = 128          # Epigenomic Encoder 출력 차원
-    CNN_KERNEL   = 7
-    N_TISSUES    = 3            # liver=0, heart=1, brain=2
-    TISSUE_DIM   = 128          # Tissue Embedding 차원 (EPI_HIDDEN 과 동일)
+# ── Config ────────────────────────────────────────────────────────────
+class Config:
+    EPI_DIR = "epigenomic_signals"
+    PATHO_FILES  = [("signals_liver_zscore.npz", 0),
+                    ("signals_heart_zscore.npz",  1),
+                    ("signals_brain_zscore.npz",  2)]
+    BENIGN_FILES = [("signals_benign_liver_zscore.npz", 0),
+                    ("signals_benign_heart_zscore.npz", 1),
+                    ("signals_benign_brain_zscore.npz", 2)]
 
-    # Late Fusion 전용 파라미터
-    # concat 후 입력 차원 = 768(CLS) + EPI_HIDDEN + TISSUE_DIM
-    # → fusion_in = 768 + 128 + 128 = 1024
-    FUSION_HIDDEN = 512         # Fusion Linear 중간 차원
+    EPI_N_CHANNELS = 2
+    EPI_USE_LEN    = 1024
+    TISSUE_MAP     = {0: "liver", 1: "heart", 2: "brain"}
+    TISSUE_STR_MAP = {"liver": 0, "heart": 1, "brain": 2}
+    N_TISSUES      = 3
+    BENIGN_RATIO   = 3
+    BENIGN_SEED    = 42
+    VAL_RATIO      = 0.10
+    TEST_RATIO     = 0.10
 
-    BATCH_SIZE   = 16
-    GRAD_ACCUM   = 2
-    EPOCHS       = 30
-    PATIENCE     = 5
-    LR_BACKBONE  = 1e-5
-    LR_HEAD      = 1e-4
-    WEIGHT_DECAY = 1e-2
-    WARMUP_RATIO = 0.1
-    BENIGN_RATIO = 3            # benign : pathogenic 비율
-    SEEDS        = [42, 123, 456]
+    MODEL_NAME     = "zhihan1996/DNABERT-2-117M"
+    MAX_LENGTH     = 256
+    HIDDEN_DIM     = 768
+    EPI_HIDDEN     = 128
+    CNN_KERNEL     = 7
+    TISSUE_DIM     = 768       # baseline3 TISSUE_EMB_DIM 과 동일
+    FUSION_HIDDEN  = 512
 
-    EPI_DIR      = Path("/workspace/gLM-with-ephigenomic/epigenomic_signals")
-    OUTPUT_DIR   = Path("./outputs/basic_baseline2")
-
-    TISSUE_MAP   = {"liver": 0, "heart": 1, "brain": 2}
-    SEQ_MIN      = 600
-    SEQ_MAX      = 1100
-
-    # npz 파일명 패턴 (baseline3 와 동일)
-    PATHO_FILES  = [
-        "signals_liver_zscore.npz",
-        "signals_heart_zscore.npz",
-        "signals_brain_zscore.npz",
-    ]
-    BENIGN_FILES = [
-        "signals_benign_liver_zscore.npz",
-        "signals_benign_heart_zscore.npz",
-        "signals_benign_brain_zscore.npz",
-    ]
+    DROPOUT        = 0.1
+    BATCH_SIZE     = 8
+    GRAD_ACCUM     = 2
+    LR_BACKBONE    = 1e-5
+    LR_HEAD        = 1e-4
+    WEIGHT_DECAY   = 0.01
+    MAX_GRAD_NORM  = 1.0
+    NUM_EPOCHS     = 30
+    PATIENCE       = 5
+    WARMUP_RATIO   = 0.05
+    FP16           = True
+    SEEDS          = [42, 123, 456]
+    OUTPUT_DIR     = "outputs/basic_baseline2"
+    NUM_WORKERS    = 4
 
 
-cfg = CFG()
+# ── Utilities ─────────────────────────────────────────────────────────
+def set_seed(seed):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def get_device(fp16):
+    if torch.cuda.is_available():
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        return torch.device("cuda"), fp16
+    print("  GPU 없음 → CPU (FP16 비활성화)")
+    return torch.device("cpu"), False
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 2. 데이터셋 (baseline3 와 완전 동일)
-# ══════════════════════════════════════════════════════════════════════
-TISSUE_MAP = {"liver": 0, "heart": 1, "brain": 2}
+# ── 데이터 로드 ───────────────────────────────────────────────────────
+def _load_npz(fpath, cfg):
+    data = np.load(str(fpath), allow_pickle=True)
+    sequences = data["sequence"].tolist()
+    labels    = data["label"].astype(np.int64)
+    tid_raw   = data["tissue_id"]
+    if tid_raw.dtype.kind in ("U", "S", "O"):
+        tissue_ids = np.array([cfg.TISSUE_STR_MAP[str(t)] for t in tid_raw], dtype=np.int64)
+    else:
+        tissue_ids = tid_raw.astype(np.int64)
+    h3k27ac = data["h3k27ac"][:, :cfg.EPI_USE_LEN].astype(np.float32)
+    dnase   = data["dnase"][:,   :cfg.EPI_USE_LEN].astype(np.float32)
+    return dict(sequences=sequences, labels=labels, tissue_ids=tissue_ids,
+                h3k27ac=h3k27ac, dnase=dnase)
 
-def _load_npz(path: Path, benign_ratio: int = None, rng=None):
-    """npz 한 파일 로드 → list of dict"""
-    d = np.load(path, allow_pickle=True)
-    seqs     = d["sequence"]
-    labels   = d["label"].astype(int)
-    tids_raw = d["tissue_id"]
-    h3k      = d["h3k27ac"][:, :1024].astype(np.float32)
-    dnase    = d["dnase"][:, :1024].astype(np.float32)
+def load_all_data(cfg):
+    epi_dir = Path(cfg.EPI_DIR)
+    all_seqs, all_labels, all_tids, all_h3k, all_dnase = [], [], [], [], []
 
-    # tissue_id: str → int 변환
-    def _tid(x):
-        if isinstance(x, (int, np.integer)):
-            return int(x)
-        s = str(x).strip().lower()
-        return TISSUE_MAP.get(s, 0)
+    print("\n─── Pathogenic npz 로드 ───────────────────────────────")
+    n_patho = {}
+    for fname, tid in cfg.PATHO_FILES:
+        d = _load_npz(epi_dir / fname, cfg)
+        n = len(d["sequences"]); n_patho[tid] = n
+        print(f"  {fname}: {n:,} rows (tid={tid}, label=1)")
+        all_seqs.extend(d["sequences"]); all_labels.append(d["labels"])
+        all_tids.append(d["tissue_ids"]); all_h3k.append(d["h3k27ac"])
+        all_dnase.append(d["dnase"])
 
-    rows = []
-    for i in range(len(seqs)):
-        seq = str(seqs[i])
-        if not (cfg.SEQ_MIN <= len(seq) <= cfg.SEQ_MAX):
-            continue
-        rows.append({
-            "sequence":  seq,
-            "label":     int(labels[i]),
-            "tissue_id": _tid(tids_raw[i]),
-            "h3k27ac":   h3k[i],
-            "dnase":     dnase[i],
-        })
-    return rows
+    print(f"\n─── Benign npz 로드 (ratio={cfg.BENIGN_RATIO}) ──")
+    rng = np.random.RandomState(cfg.BENIGN_SEED)
+    for fname, tid in cfg.BENIGN_FILES:
+        d = _load_npz(epi_dir / fname, cfg)
+        n_total  = len(d["sequences"])
+        n_sample = min(n_patho[tid] * cfg.BENIGN_RATIO, n_total)
+        chosen   = rng.choice(n_total, size=n_sample, replace=False)
+        print(f"  {fname}: {n_total:,} → {n_sample:,} (tid={tid}, label=0)")
+        all_seqs.extend([d["sequences"][i] for i in chosen])
+        all_labels.append(np.zeros(n_sample, dtype=np.int64))
+        all_tids.append(np.full(n_sample, tid, dtype=np.int64))
+        all_h3k.append(d["h3k27ac"][chosen]); all_dnase.append(d["dnase"][chosen])
 
+    labels_arr = np.concatenate(all_labels); tids_arr = np.concatenate(all_tids)
+    h3k_arr    = np.concatenate(all_h3k);   dnase_arr = np.concatenate(all_dnase)
 
-def load_all_data(epi_dir: Path, benign_ratio: int, seed: int):
-    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({"sequence": all_seqs, "label": labels_arr, "tissue_id": tids_arr})
+    keep = (df["sequence"].str.len() >= 600) & (df["sequence"].str.len() <= 1100)
+    keep_idx  = np.where(keep)[0]
+    df        = df[keep].reset_index(drop=True)
+    h3k_arr   = h3k_arr[keep_idx]; dnase_arr = dnase_arr[keep_idx]
+    df["_orig_idx"] = np.arange(len(df))
 
-    patho_rows = []
-    for fn in cfg.PATHO_FILES:
-        fp = epi_dir / fn
-        if fp.exists():
-            patho_rows += _load_npz(fp)
-        else:
-            print(f"  [WARN] 파일 없음: {fp}")
-
-    benign_rows = []
-    for fn in cfg.BENIGN_FILES:
-        fp = epi_dir / fn
-        if fp.exists():
-            benign_rows += _load_npz(fp)
-        else:
-            print(f"  [WARN] 파일 없음: {fp}")
-
-    # benign 다운샘플링
-    n_target = min(len(patho_rows) * benign_ratio, len(benign_rows))
-    idx = rng.choice(len(benign_rows), n_target, replace=False)
-    benign_rows = [benign_rows[i] for i in idx]
-
-    all_rows = patho_rows + benign_rows
-    rng.shuffle(all_rows)
-
-    print(f"  Pathogenic: {len(patho_rows):,} | Benign: {len(benign_rows):,} | Total: {len(all_rows):,}")
-    return all_rows
+    print(f"\n  총 샘플: {len(df):,} | label: {dict(df['label'].value_counts().sort_index())}")
+    for tid, tname in cfg.TISSUE_MAP.items():
+        sub = df[df["tissue_id"]==tid]
+        print(f"  {tname:5s}: pos={int((sub['label']==1).sum()):,} neg={int((sub['label']==0).sum()):,}")
+    return df, h3k_arr, dnase_arr
 
 
-def chrom_split(rows, val_chroms=None, test_chroms=None):
-    """염색체 기반 train/val/test 분할 — npz에 chrom 없으면 비율 분할로 fallback"""
-    # npz에 chrom 키 없는 경우가 많으므로 비율 fallback
-    n = len(rows)
-    idx = list(range(n))
-    random.shuffle(idx)
-    t1 = int(n * 0.7)
-    t2 = int(n * 0.85)
-    train = [rows[i] for i in idx[:t1]]
-    val   = [rows[i] for i in idx[t1:t2]]
-    test  = [rows[i] for i in idx[t2:]]
-    return train, val, test
+# ── Data Split ────────────────────────────────────────────────────────
+def stratified_split(df, cfg, seed):
+    strat = df["tissue_id"].astype(str) + "_" + df["label"].astype(str)
+    if strat.value_counts().min() < 2:
+        strat = df["label"].astype(str)
+    train_val, test = train_test_split(df, test_size=cfg.TEST_RATIO,
+                                       stratify=strat, random_state=seed)
+    strat_tv = (train_val["tissue_id"].astype(str) + "_" + train_val["label"].astype(str))
+    if strat_tv.value_counts().min() < 2:
+        strat_tv = train_val["label"].astype(str)
+    train, val = train_test_split(train_val, test_size=cfg.VAL_RATIO/(1-cfg.TEST_RATIO),
+                                  stratify=strat_tv, random_state=seed)
+    return (train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True))
 
 
-class VariantDataset(Dataset):
-    def __init__(self, rows, tokenizer, max_length):
-        self.rows       = rows
+# ── Dataset ───────────────────────────────────────────────────────────
+class VariantEpiDataset(Dataset):
+    def __init__(self, df, tokenizer, h3k_arr, dnase_arr, cfg):
+        self.sequences  = df["sequence"].tolist()
+        self.labels     = df["label"].tolist()
+        self.tissue_ids = df["tissue_id"].tolist()
+        self.orig_idxs  = df["_orig_idx"].tolist()
         self.tokenizer  = tokenizer
-        self.max_length = max_length
+        self.max_length = cfg.MAX_LENGTH
+        self.h3k_arr    = h3k_arr
+        self.dnase_arr  = dnase_arr
 
-    def __len__(self):
-        return len(self.rows)
+    def __len__(self): return len(self.sequences)
 
     def __getitem__(self, idx):
-        r   = self.rows[idx]
-        enc = self.tokenizer(
-            r["sequence"],
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        epi = np.stack([r["h3k27ac"], r["dnase"]], axis=0)  # (2, 1024)
-        return {
-            "input_ids":      enc["input_ids"].squeeze(0),
-            "attention_mask": enc["attention_mask"].squeeze(0),
-            "epi":            torch.tensor(epi, dtype=torch.float32),
-            "tissue_id":      torch.tensor(r["tissue_id"], dtype=torch.long),
-            "label":          torch.tensor(r["label"], dtype=torch.float32),
-        }
+        enc = self.tokenizer(self.sequences[idx], max_length=self.max_length,
+                             padding="max_length", truncation=True, return_tensors="pt")
+        oi  = self.orig_idxs[idx]
+        epi = torch.from_numpy(np.stack([self.h3k_arr[oi], self.dnase_arr[oi]], axis=0)).float()
+        return {"input_ids":      enc["input_ids"].squeeze(0),
+                "attention_mask": enc["attention_mask"].squeeze(0),
+                "epi_signal":     epi,
+                "label":          torch.tensor(self.labels[idx],     dtype=torch.float),
+                "tissue_id":      torch.tensor(self.tissue_ids[idx], dtype=torch.long)}
+
+def make_weighted_sampler(df):
+    labels  = df["label"].values; counts = np.bincount(labels)
+    weights = torch.tensor(1.0 / counts[labels], dtype=torch.double)
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+def _make_loader(ds, batch_size, shuffle=False, sampler=None, num_workers=4):
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, sampler=sampler,
+                      num_workers=num_workers, pin_memory=torch.cuda.is_available())
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 3. 모델 — Late Fusion 버전
-#    baseline3 와 달라지는 부분:
-#      EpiEncoder → GlobalAvgPool → [B, epi_hidden]
-#      Tissue Embedding → [B, tissue_dim]
-#      DNA CLS token → [B, 768]
-#      세 벡터를 concat → Linear(fusion_in, fusion_hidden) → LayerNorm → MLP
-# ══════════════════════════════════════════════════════════════════════
-class EpiEncoder(nn.Module):
-    """
-    baseline3 와 동일한 1D CNN 구조.
-    Late Fusion 에서는 출력에 GlobalAvgPool 적용해 [B, epi_hidden] 벡터로 압축.
-    """
-    def __init__(self, epi_hidden: int, kernel: int):
+# ── Model — Late Fusion ───────────────────────────────────────────────
+class EpigenomicEncoder(nn.Module):
+    def __init__(self, in_channels=2, hidden=128, kernel=7):
         super().__init__()
-        self.conv1 = nn.Conv1d(2, epi_hidden, kernel, padding=kernel // 2)
-        self.norm1 = nn.LayerNorm(epi_hidden)
-        self.conv2 = nn.Conv1d(epi_hidden, epi_hidden, kernel, padding=kernel // 2)
-        self.norm2 = nn.LayerNorm(epi_hidden)
-
-    def forward(self, epi):
-        # epi: [B, 2, 1024]
-        x = F.gelu(self.conv1(epi))                # [B, epi_hidden, 1024]
-        x = self.norm1(x.transpose(1, 2)).transpose(1, 2)
-        x = F.gelu(self.conv2(x))                  # [B, epi_hidden, 1024]
-        x = self.norm2(x.transpose(1, 2)).transpose(1, 2)
-        x = x.mean(dim=2)                           # GlobalAvgPool → [B, epi_hidden]
-        return x
-
+        self.cnn = nn.Sequential(
+            nn.Conv1d(in_channels, hidden, kernel, padding=kernel//2),
+            nn.BatchNorm1d(hidden), nn.GELU(),
+            nn.Conv1d(hidden, hidden, kernel, padding=kernel//2),
+            nn.BatchNorm1d(hidden), nn.GELU(),
+        )
+    def forward(self, x):
+        return self.cnn(x).mean(dim=2)   # GlobalAvgPool → [B, epi_hidden]
 
 class LateFusionModel(nn.Module):
-    """
-    DNABERT-2 (CLS 토큰) + EpiEncoder (GlobalAvgPool) + Tissue Embedding
-    → Concatenation → Linear → MLP → 병원성 확률
-    """
-    def __init__(self, model_name: str, epi_hidden: int, n_tissues: int,
-                 tissue_dim: int, fusion_hidden: int, kernel: int):
+    def __init__(self, cfg):
         super().__init__()
+        bert_cfg     = BertConfig.from_pretrained(cfg.MODEL_NAME)
+        self.dna_enc = AutoModel.from_pretrained(cfg.MODEL_NAME,
+                           trust_remote_code=True, config=bert_cfg)
+        self.epi_enc     = EpigenomicEncoder(cfg.EPI_N_CHANNELS, cfg.EPI_HIDDEN, cfg.CNN_KERNEL)
+        self.tissue_emb  = nn.Embedding(cfg.N_TISSUES, cfg.TISSUE_DIM)
+        self.tissue_norm = nn.LayerNorm(cfg.TISSUE_DIM)
 
-        # ── DNA Encoder ──────────────────────────────────────────────
-        bert_cfg  = BertConfig.from_pretrained(model_name, trust_remote_code=True)
-        self.dna_enc = AutoModel.from_pretrained(
-            model_name,
-            config=bert_cfg,
-            trust_remote_code=True,
-            low_cpu_mem_usage=False,
-        )
-        dna_dim = self.dna_enc.config.hidden_size  # 768
-
-        # ── Epigenomic Encoder ────────────────────────────────────────
-        self.epi_enc = EpiEncoder(epi_hidden, kernel)
-
-        # ── Tissue Embedding ──────────────────────────────────────────
-        self.tissue_emb  = nn.Embedding(n_tissues, tissue_dim)
-        self.tissue_norm = nn.LayerNorm(tissue_dim)
-
-        # ── Late Fusion: concat → projection ─────────────────────────
-        fusion_in = dna_dim + epi_hidden + tissue_dim   # 768 + 128 + 128 = 1024
+        fusion_in = cfg.HIDDEN_DIM + cfg.EPI_HIDDEN + cfg.TISSUE_DIM
         self.fusion_proj = nn.Sequential(
-            nn.Linear(fusion_in, fusion_hidden),
-            nn.LayerNorm(fusion_hidden),
-            nn.GELU(),
+            nn.Linear(fusion_in, cfg.FUSION_HIDDEN),
+            nn.LayerNorm(cfg.FUSION_HIDDEN), nn.GELU(),
         )
-
-        # ── MLP Classifier ────────────────────────────────────────────
         self.classifier = nn.Sequential(
-            nn.Linear(fusion_hidden, fusion_hidden // 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(fusion_hidden // 2, 1),
+            nn.Dropout(cfg.DROPOUT),
+            nn.Linear(cfg.FUSION_HIDDEN, 256), nn.GELU(),
+            nn.Dropout(cfg.DROPOUT),
+            nn.Linear(256, 64), nn.GELU(),
+            nn.Linear(64, 1),
         )
 
-    def forward(self, input_ids, attention_mask, epi, tissue_id):
-        # ── DNA: CLS 토큰 ─────────────────────────────────────────────
-        dna_out = self.dna_enc(input_ids=input_ids,
-                               attention_mask=attention_mask)
-        hidden = dna_out[0] if isinstance(dna_out, tuple) else dna_out.last_hidden_state
-        cls_vec = hidden[:, 0, :]  # [B, 768]
-
-        # ── Epigenomic: GlobalAvgPool ─────────────────────────────────
-        epi_vec = self.epi_enc(epi)                   # [B, epi_hidden]
-
-        # ── Tissue Embedding ──────────────────────────────────────────
-        tis_vec = self.tissue_norm(self.tissue_emb(tissue_id))  # [B, tissue_dim]
-
-        # ── Late Fusion ───────────────────────────────────────────────
-        fused = torch.cat([cls_vec, epi_vec, tis_vec], dim=1)   # [B, fusion_in]
-        fused = self.fusion_proj(fused)                          # [B, fusion_hidden]
-
-        logit = self.classifier(fused).squeeze(-1)               # [B]
-        return logit
+    def forward(self, input_ids, attention_mask, epi_signal, tissue_id):
+        dna_out = self.dna_enc(input_ids=input_ids, attention_mask=attention_mask)
+        hidden  = dna_out[0] if isinstance(dna_out, tuple) else dna_out.last_hidden_state
+        cls_vec = hidden[:, 0, :]                                          # [B, 768]
+        epi_vec = self.epi_enc(epi_signal)                                 # [B, epi_hidden]
+        tis_vec = self.tissue_norm(self.tissue_emb(tissue_id))             # [B, tissue_dim]
+        fused   = self.fusion_proj(torch.cat([cls_vec, epi_vec, tis_vec], dim=1))
+        return self.classifier(fused).squeeze(-1)
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 4. 학습 유틸 (baseline3 와 동일)
-# ══════════════════════════════════════════════════════════════════════
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def make_sampler(rows):
-    labels = np.array([r["label"] for r in rows])
-    counts = np.bincount(labels)
-    weights = 1.0 / counts[labels]
-    return WeightedRandomSampler(torch.tensor(weights, dtype=torch.float32),
-                                 num_samples=len(rows), replacement=True)
-
-
-def compute_metrics(labels, probs, tissue_ids):
-    labels    = np.array(labels)
-    probs     = np.array(probs)
-    tissue_ids = np.array(tissue_ids)
-
-    per_tissue = {}
-    for tid, tname in enumerate(["liver", "heart", "brain"]):
-        mask = tissue_ids == tid
-        if mask.sum() < 2 or labels[mask].sum() == 0:
-            per_tissue[tname] = float("nan")
-            continue
-        try:
-            per_tissue[tname] = average_precision_score(labels[mask], probs[mask])
-        except Exception:
-            per_tissue[tname] = float("nan")
-
-    valid = [v for v in per_tissue.values() if not np.isnan(v)]
-    macro_auprc = float(np.mean(valid)) if valid else float("nan")
-
-    preds = (probs >= 0.5).astype(int)
-    return {
-        "macro_auprc": macro_auprc,
-        "per_tissue":  per_tissue,
-        "f1":          f1_score(labels, preds, zero_division=0),
-        "precision":   precision_score(labels, preds, zero_division=0),
-        "recall":      recall_score(labels, preds, zero_division=0),
-    }
-
-
-def get_optimizer(model, lr_backbone, lr_head, weight_decay):
-    backbone_ids = set(id(p) for p in model.dna_enc.parameters())
-    backbone_params = [p for p in model.parameters() if id(p) in backbone_ids]
-    head_params     = [p for p in model.parameters() if id(p) not in backbone_ids]
-    return torch.optim.AdamW([
-        {"params": backbone_params, "lr": lr_backbone},
-        {"params": head_params,     "lr": lr_head},
-    ], weight_decay=weight_decay)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 5. 학습 / 평가 루프 (baseline3 와 동일)
-# ══════════════════════════════════════════════════════════════════════
-def train_one_epoch(model, loader, optimizer, scheduler, scaler,
-                    device, grad_accum, use_fp16):
-    model.train()
-    pos_w = torch.tensor([cfg.BENIGN_RATIO], dtype=torch.float32, device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_w)
-    total_loss, steps = 0.0, 0
-    optimizer.zero_grad()
-
-    for i, batch in enumerate(tqdm(loader, desc="  train", leave=False)):
-        input_ids = batch["input_ids"].to(device)
-        attn_mask = batch["attention_mask"].to(device)
-        epi       = batch["epi"].to(device)
-        tissue_id = batch["tissue_id"].to(device)
-        labels    = batch["label"].to(device)
-
-        if use_fp16:
-            with torch.cuda.amp.autocast():
-                logit = model(input_ids, attn_mask, epi, tissue_id)
-                loss  = criterion(logit, labels) / grad_accum
-            scaler.scale(loss).backward()
-        else:
-            logit = model(input_ids, attn_mask, epi, tissue_id)
-            loss  = criterion(logit, labels) / grad_accum
-            loss.backward()
-
-        if (i + 1) % grad_accum == 0:
-            if use_fp16:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-
-        total_loss += loss.item() * grad_accum
-        steps += 1
-
-    return total_loss / max(steps, 1)
-
-
+# ── Metrics ───────────────────────────────────────────────────────────
 @torch.no_grad()
-def evaluate(model, loader, device, use_fp16):
+def run_inference(model, loader, device, fp16):
     model.eval()
-    all_labels, all_probs, all_tids = [], [], []
-
-    for batch in tqdm(loader, desc="  eval ", leave=False):
-        input_ids = batch["input_ids"].to(device)
-        attn_mask = batch["attention_mask"].to(device)
-        epi       = batch["epi"].to(device)
-        tissue_id = batch["tissue_id"].to(device)
-
-        if use_fp16:
-            with torch.cuda.amp.autocast():
-                logit = model(input_ids, attn_mask, epi, tissue_id)
-        else:
-            logit = model(input_ids, attn_mask, epi, tissue_id)
-
-        prob = torch.sigmoid(logit).cpu().float().numpy()
+    all_labels, all_probs, all_tissues = [], [], []
+    for batch in tqdm(loader, desc="  Inference", leave=False):
+        ids  = batch["input_ids"].to(device); mask = batch["attention_mask"].to(device)
+        epi  = batch["epi_signal"].to(device); tids = batch["tissue_id"].to(device)
+        with torch.cuda.amp.autocast(enabled=fp16):
+            logits = model(ids, mask, epi, tids)
+        probs = torch.sigmoid(logits).float().cpu().numpy()
+        all_probs.extend(probs.tolist())
         all_labels.extend(batch["label"].numpy().tolist())
-        all_probs.extend(prob.tolist())
-        all_tids.extend(batch["tissue_id"].numpy().tolist())
+        all_tissues.extend(batch["tissue_id"].numpy().tolist())
+    return (np.array(all_labels, dtype=np.float32),
+            np.array(all_probs,  dtype=np.float32),
+            np.array(all_tissues,dtype=np.int32))
 
-    return compute_metrics(all_labels, all_probs, all_tids)
+def compute_metrics(labels, probs, tissues, cfg):
+    metrics, auprc_list = {}, []
+    benign_msk = (labels == 0)   # label 기준으로 benign 구분 (baseline3 동일)
+    for tid, tname in cfg.TISSUE_MAP.items():
+        msk = ((tissues == tid) & (labels == 1)) | benign_msk
+        if msk.sum() == 0 or labels[msk].sum() == 0:
+            print(f"  Warning: {tname} 평가 데이터 없음"); continue
+        l, p  = labels[msk], probs[msk]; preds = (p >= 0.5).astype(int)
+        auprc = average_precision_score(l, p)
+        metrics[tname] = {
+            "auprc":        float(round(auprc, 4)),
+            "precision":    float(round(precision_score(l, preds, zero_division=0), 4)),
+            "recall":       float(round(recall_score(l, preds, zero_division=0), 4)),
+            "f1":           float(round(f1_score(l, preds, zero_division=0), 4)),
+            "n_pathogenic": int(l.sum()), "n_benign": int((l==0).sum()),
+        }
+        auprc_list.append(auprc)
+    metrics["macro_auprc"] = float(round(np.mean(auprc_list), 4)) if auprc_list else 0.0
+    return metrics
+
+def print_metrics(metrics, prefix=""):
+    print(f"{prefix}Macro-AUPRC: {metrics['macro_auprc']:.4f}")
+    for k, v in metrics.items():
+        if k == "macro_auprc": continue
+        print(f"{prefix}  {k:6s} AUPRC={v['auprc']:.4f} | "
+              f"P={v['precision']:.3f} R={v['recall']:.3f} F1={v['f1']:.3f} "
+              f"(pos={v['n_pathogenic']}, neg={v['n_benign']})")
+
+def _save_predictions(labels, probs, tissues, path):
+    pd.DataFrame({"label": labels.tolist(), "prob": probs.tolist(),
+                  "tissue_id": tissues.tolist()}).to_csv(path, index=False)
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 6. 메인 학습 루프
-# ══════════════════════════════════════════════════════════════════════
-def run_single_seed(seed: int, args):
+# ── Train ─────────────────────────────────────────────────────────────
+def run_train(cfg, df, h3k_arr, dnase_arr, seed):
     set_seed(seed)
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_fp16 = not args.no_fp16 and device.type == "cuda"
-    out_dir  = Path(args.output_dir) / f"seed_{seed}"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir   = Path(cfg.OUTPUT_DIR) / f"seed_{seed}"
+    split_dir = out_dir / "splits"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    device, use_fp16 = get_device(cfg.FP16)
 
-    print(f"\n{'='*60}")
-    print(f"  Seed={seed} | device={device} | fp16={use_fp16}")
-    print(f"  Output: {out_dir}")
-    print(f"{'='*60}")
+    print(f"\n{'='*62}")
+    print(f"  [TRAIN] Stage2 LateFusion | Seed={seed} | FP16={use_fp16}")
+    print('='*62)
 
-    # ── 데이터 ────────────────────────────────────────────────────────
-    all_rows = load_all_data(Path(args.epi_dir), args.benign_ratio, seed)
-    train_rows, val_rows, test_rows = chrom_split(all_rows)
-    print(f"  Split  train={len(train_rows):,} val={len(val_rows):,} test={len(test_rows):,}")
+    train_df, val_df, test_df = stratified_split(df, cfg, seed)
+    np.save(str(split_dir / "val_orig_idx.npy"),  val_df["_orig_idx"].values)
+    np.save(str(split_dir / "test_orig_idx.npy"), test_df["_orig_idx"].values)
+    with open(split_dir / "meta.json", "w") as f:
+        json.dump({"seed": seed, "benign_seed": cfg.BENIGN_SEED,
+                   "train": len(train_df), "val": len(val_df),
+                   "test": len(test_df), "total": len(df)}, f, indent=2)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg.MODEL_NAME, trust_remote_code=True
-    )
+    n_pos = int((train_df["label"]==1).sum()); n_neg = int((train_df["label"]==0).sum())
+    print(f"  Train={len(train_df):,} | Val={len(val_df):,} | Test={len(test_df):,}")
+    print(f"  Train pos={n_pos:,} neg={n_neg:,}")
 
-    train_ds = VariantDataset(train_rows, tokenizer, cfg.MAX_LENGTH)
-    val_ds   = VariantDataset(val_rows,   tokenizer, cfg.MAX_LENGTH)
-    test_ds  = VariantDataset(test_rows,  tokenizer, cfg.MAX_LENGTH)
+    tokenizer    = AutoTokenizer.from_pretrained(cfg.MODEL_NAME, trust_remote_code=True)
+    train_ds     = VariantEpiDataset(train_df, tokenizer, h3k_arr, dnase_arr, cfg)
+    val_ds       = VariantEpiDataset(val_df,   tokenizer, h3k_arr, dnase_arr, cfg)
+    train_loader = _make_loader(train_ds, cfg.BATCH_SIZE,
+                                sampler=make_weighted_sampler(train_df),
+                                num_workers=cfg.NUM_WORKERS)
+    val_loader   = _make_loader(val_ds, cfg.BATCH_SIZE*2, num_workers=cfg.NUM_WORKERS)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              sampler=make_sampler(train_rows),
-                              num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_ds, batch_size=args.batch_size * 2,
-                              shuffle=False, num_workers=4, pin_memory=True)
-    test_loader  = DataLoader(test_ds, batch_size=args.batch_size * 2,
-                              shuffle=False, num_workers=4, pin_memory=True)
+    model = LateFusionModel(cfg).to(device)
+    n_p   = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  학습 파라미터: {n_p/1e6:.1f}M")
 
-    # ── 모델 ──────────────────────────────────────────────────────────
-    model = LateFusionModel(
-        model_name   = cfg.MODEL_NAME,
-        epi_hidden   = args.epi_hidden,
-        n_tissues    = cfg.N_TISSUES,
-        tissue_dim   = cfg.TISSUE_DIM,
-        fusion_hidden= args.fusion_hidden,
-        kernel       = cfg.CNN_KERNEL,
-    ).to(device)
+    optimizer = torch.optim.AdamW([
+        {"params": model.dna_enc.parameters(),    "lr": cfg.LR_BACKBONE},
+        {"params": model.epi_enc.parameters(),    "lr": cfg.LR_HEAD},
+        {"params": model.tissue_emb.parameters(), "lr": cfg.LR_HEAD},
+        {"params": model.tissue_norm.parameters(),"lr": cfg.LR_HEAD},
+        {"params": model.fusion_proj.parameters(),"lr": cfg.LR_HEAD},
+        {"params": model.classifier.parameters(), "lr": cfg.LR_HEAD},
+    ], weight_decay=cfg.WEIGHT_DECAY)
 
-    total_steps   = (len(train_loader) // cfg.GRAD_ACCUM) * args.epochs
-    warmup_steps  = int(total_steps * cfg.WARMUP_RATIO)
-    optimizer     = get_optimizer(model, args.lr_backbone, args.lr_head, cfg.WEIGHT_DECAY)
-    scheduler     = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    scaler        = torch.cuda.amp.GradScaler(enabled=use_fp16)
+    total_steps  = (len(train_loader) // cfg.GRAD_ACCUM) * cfg.NUM_EPOCHS
+    warmup_steps = int(total_steps * cfg.WARMUP_RATIO)
+    scheduler    = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    pos_w        = torch.tensor(n_neg / n_pos, dtype=torch.float).to(device)
+    crit         = nn.BCEWithLogitsLoss(pos_weight=pos_w)
+    scaler       = torch.cuda.amp.GradScaler(enabled=use_fp16)
+    print(f"  pos_weight={pos_w.item():.2f}")
 
-    # ── 학습 ──────────────────────────────────────────────────────────
-    best_auprc   = -1.0
-    patience_cnt = 0
-    history      = []
+    best_macro, patience_cnt, history = 0.0, 0, []
+    for epoch in range(1, cfg.NUM_EPOCHS+1):
+        model.train(); epoch_loss = 0.0; optimizer.zero_grad()
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                    desc=f"  Epoch {epoch:02d}/{cfg.NUM_EPOCHS}")
+        for step, batch in pbar:
+            ids  = batch["input_ids"].to(device); mask = batch["attention_mask"].to(device)
+            epi  = batch["epi_signal"].to(device); tids = batch["tissue_id"].to(device)
+            lbl  = batch["label"].to(device)
+            with torch.cuda.amp.autocast(enabled=use_fp16):
+                loss = crit(model(ids, mask, epi, tids), lbl) / cfg.GRAD_ACCUM
+            scaler.scale(loss).backward()
+            epoch_loss += loss.item() * cfg.GRAD_ACCUM
+            if (step+1) % cfg.GRAD_ACCUM == 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.MAX_GRAD_NORM)
+                scaler.step(optimizer); scaler.update()
+                scheduler.step(); optimizer.zero_grad()
+            pbar.set_postfix({"loss": f"{epoch_loss/(step+1):.4f}"})
 
-    for epoch in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(model, train_loader, optimizer, scheduler,
-                                  scaler, device, cfg.GRAD_ACCUM, use_fp16)
-        val_m   = evaluate(model, val_loader, device, use_fp16)
+        val_lbl, val_prob, val_tid = run_inference(model, val_loader, device, use_fp16)
+        val_m = compute_metrics(val_lbl, val_prob, val_tid, cfg)
+        macro = val_m["macro_auprc"]; avg_l = epoch_loss / len(train_loader)
+        print(f"\n  Epoch {epoch:02d} | Loss={avg_l:.4f} | Val Macro-AUPRC={macro:.4f}")
+        print_metrics(val_m, prefix="  ")
 
-        print(f"  Epoch {epoch:02d} | loss={tr_loss:.4f} "
-              f"| val AUPRC={val_m['macro_auprc']:.4f} "
-              f"(liver={val_m['per_tissue']['liver']:.3f} "
-              f"heart={val_m['per_tissue']['heart']:.3f} "
-              f"brain={val_m['per_tissue']['brain']:.3f}) "
-              f"| F1={val_m['f1']:.4f}")
+        row = {"epoch": epoch, "loss": avg_l, "val_macro_auprc": macro}
+        for t, m in val_m.items():
+            if t != "macro_auprc": row[f"val_{t}_auprc"] = m["auprc"]
+        history.append(row)
 
-        history.append({"epoch": epoch, "tr_loss": tr_loss, **val_m})
-
-        if val_m["macro_auprc"] > best_auprc:
-            best_auprc = val_m["macro_auprc"]
-            patience_cnt = 0
-            torch.save({
-                "epoch":       epoch,
-                "model_state": model.state_dict(),
-                "val_metrics": val_m,
-                "config": {
-                    "model_name":   cfg.MODEL_NAME,
-                    "epi_hidden":   args.epi_hidden,
-                    "tissue_dim":   cfg.TISSUE_DIM,
-                    "fusion_hidden":args.fusion_hidden,
-                    "fusion_type":  "late_fusion",
-                },
-            }, out_dir / "best_model.pt")
-            print(f"  ✓ best saved (AUPRC={best_auprc:.4f})")
+        if macro > best_macro:
+            best_macro, patience_cnt = macro, 0
+            torch.save({"epoch": epoch, "model_state": model.state_dict(),
+                        "val_metrics": val_m,
+                        "config": {"model_name": cfg.MODEL_NAME, "max_length": cfg.MAX_LENGTH,
+                                   "epi_hidden": cfg.EPI_HIDDEN, "fusion_hidden": cfg.FUSION_HIDDEN,
+                                   "fusion_type": "late_fusion"}},
+                       out_dir / "best_model.pt")
+            print(f"  ✅ Best 모델 저장 (Macro-AUPRC={best_macro:.4f})")
         else:
             patience_cnt += 1
+            print(f"  patience: {patience_cnt}/{cfg.PATIENCE}")
             if patience_cnt >= cfg.PATIENCE:
-                print(f"  Early stop at epoch {epoch}")
-                break
+                print(f"\n  Early stopping @ epoch {epoch}"); break
 
-    # ── 테스트 ────────────────────────────────────────────────────────
+    pd.DataFrame(history).to_csv(out_dir / "training_history.csv", index=False)
     ckpt = torch.load(out_dir / "best_model.pt", map_location=device)
+    with open(out_dir / "val_metrics.json", "w") as f:
+        json.dump(ckpt["val_metrics"], f, indent=2, ensure_ascii=False)
+    print(f"\n  ✅ 학습 완료: {out_dir}/")
+    return pd.DataFrame(history), ckpt["val_metrics"]
+
+
+# ── Eval ──────────────────────────────────────────────────────────────
+def run_eval(cfg, df, h3k_arr, dnase_arr, seed, split="test"):
+    out_dir   = Path(cfg.OUTPUT_DIR) / f"seed_{seed}"
+    split_dir = out_dir / "splits"
+    device, use_fp16 = get_device(cfg.FP16)
+    print(f"\n{'='*62}\n  [{split.upper()}] Stage2 LateFusion | Seed={seed}\n{'='*62}")
+
+    orig_idx = np.load(str(split_dir / f"{split}_orig_idx.npy"))
+    eval_df  = df.iloc[orig_idx].reset_index(drop=True)
+    print(f"  {split} 샘플: {len(eval_df):,}  "
+          f"(pos={int((eval_df['label']==1).sum()):,}, neg={int((eval_df['label']==0).sum()):,})")
+
+    ckpt  = torch.load(str(out_dir / "best_model.pt"), map_location=device)
+    model = LateFusionModel(cfg)
     model.load_state_dict(ckpt["model_state"])
-    test_m = evaluate(model, test_loader, device, use_fp16)
+    model = model.to(device)
+    print(f"  모델 로드 완료 (Best epoch={ckpt['epoch']})")
 
-    print(f"\n  [Test] AUPRC={test_m['macro_auprc']:.4f} "
-          f"F1={test_m['f1']:.4f} "
-          f"Prec={test_m['precision']:.4f} "
-          f"Rec={test_m['recall']:.4f}")
-    print(f"         liver={test_m['per_tissue']['liver']:.4f} "
-          f"heart={test_m['per_tissue']['heart']:.4f} "
-          f"brain={test_m['per_tissue']['brain']:.4f}")
+    tokenizer   = AutoTokenizer.from_pretrained(cfg.MODEL_NAME, trust_remote_code=True)
+    eval_ds     = VariantEpiDataset(eval_df, tokenizer, h3k_arr, dnase_arr, cfg)
+    eval_loader = _make_loader(eval_ds, cfg.BATCH_SIZE*2, num_workers=cfg.NUM_WORKERS)
 
-    # ── 저장 ──────────────────────────────────────────────────────────
-    with open(out_dir / "test_metrics.json", "w") as f:
-        json.dump(test_m, f, indent=2)
-    with open(out_dir / "history.json", "w") as f:
-        json.dump(history, f, indent=2)
+    labels, probs, tissues = run_inference(model, eval_loader, device, use_fp16)
+    metrics = compute_metrics(labels, probs, tissues, cfg)
+    print(f"\n  {split.upper()} 결과:"); print_metrics(metrics, prefix="  ")
 
-    return test_m
+    with open(out_dir / f"{split}_metrics.json", "w") as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
+    _save_predictions(labels, probs, tissues, out_dir / f"{split}_predictions.csv")
+    print(f"  결과 저장: {out_dir}/{split}_metrics.json")
+    return metrics
 
 
-# ══════════════════════════════════════════════════════════════════════
-# 7. CLI
-# ══════════════════════════════════════════════════════════════════════
-def verify_data(epi_dir: Path):
-    """데이터 파일 존재 여부 및 배열 shape 확인"""
-    print("\n[Verify] npz 파일 확인")
-    all_ok = True
-    for fn in cfg.PATHO_FILES + cfg.BENIGN_FILES:
-        fp = epi_dir / fn
-        if not fp.exists():
-            print(f"  ✗ 없음: {fp}")
-            all_ok = False
-            continue
-        d = np.load(fp, allow_pickle=True)
-        keys = list(d.keys())
-        n    = len(d["sequence"])
-        h3k_shape = d["h3k27ac"].shape
-        dns_shape = d["dnase"].shape
-        print(f"  ✓ {fn}: n={n:,} h3k27ac={h3k_shape} dnase={dns_shape}")
-        if not all(k in keys for k in ["sequence","label","tissue_id","h3k27ac","dnase"]):
-            print(f"    [WARN] 누락 키: {set(['sequence','label','tissue_id','h3k27ac','dnase'])-set(keys)}")
-    if all_ok:
-        print("  → 모든 파일 확인 완료\n")
-    return all_ok
-
+# ── Main ──────────────────────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser(description="Stage 2: DNABERT-2 + Late Fusion")
+    p.add_argument("--mode",          choices=["train","val","test","all"], default="all")
+    p.add_argument("--epi_dir",       default=Config.EPI_DIR)
+    p.add_argument("--output_dir",    default=Config.OUTPUT_DIR)
+    p.add_argument("--seeds",         nargs="+", type=int, default=Config.SEEDS)
+    p.add_argument("--single_seed",   type=int,  default=None)
+    p.add_argument("--batch_size",    type=int,  default=Config.BATCH_SIZE)
+    p.add_argument("--num_epochs",    type=int,  default=Config.NUM_EPOCHS)
+    p.add_argument("--benign_ratio",  type=int,  default=Config.BENIGN_RATIO)
+    p.add_argument("--epi_hidden",    type=int,  default=Config.EPI_HIDDEN)
+    p.add_argument("--fusion_hidden", type=int,  default=Config.FUSION_HIDDEN)
+    p.add_argument("--lr_backbone",   type=float,default=Config.LR_BACKBONE)
+    p.add_argument("--lr_head",       type=float,default=Config.LR_HEAD)
+    p.add_argument("--no_fp16",       action="store_true")
+    p.add_argument("--verify_only",   action="store_true")
+    return p.parse_args()
 
 def main():
-    parser = argparse.ArgumentParser(description="Baseline2: Late Fusion")
+    args = parse_args(); cfg = Config()
+    cfg.EPI_DIR      = args.epi_dir;      cfg.OUTPUT_DIR   = args.output_dir
+    cfg.SEEDS        = [args.single_seed] if args.single_seed else args.seeds
+    cfg.BATCH_SIZE   = args.batch_size;   cfg.NUM_EPOCHS   = args.num_epochs
+    cfg.BENIGN_RATIO = args.benign_ratio; cfg.EPI_HIDDEN   = args.epi_hidden
+    cfg.FUSION_HIDDEN= args.fusion_hidden;cfg.LR_BACKBONE  = args.lr_backbone
+    cfg.LR_HEAD      = args.lr_head;      cfg.FP16         = not args.no_fp16
 
-    parser.add_argument("--mode",         default="all",  choices=["train","eval","all"])
-    parser.add_argument("--epi_dir",      default=str(cfg.EPI_DIR))
-    parser.add_argument("--output_dir",   default=str(cfg.OUTPUT_DIR))
-    parser.add_argument("--epochs",       type=int,   default=cfg.EPOCHS)
-    parser.add_argument("--batch_size",   type=int,   default=cfg.BATCH_SIZE)
-    parser.add_argument("--epi_hidden",    type=int,   default=cfg.EPI_HIDDEN)
-    parser.add_argument("--fusion_hidden", type=int,   default=cfg.FUSION_HIDDEN)
-    parser.add_argument("--lr_backbone",  type=float, default=cfg.LR_BACKBONE)
-    parser.add_argument("--lr_head",      type=float, default=cfg.LR_HEAD)
-    parser.add_argument("--benign_ratio", type=int,   default=cfg.BENIGN_RATIO)
-    parser.add_argument("--seeds",        type=int,   nargs="+", default=cfg.SEEDS)
-    parser.add_argument("--single_seed",  type=int,   default=None)
-    parser.add_argument("--no_fp16",      action="store_true")
-    parser.add_argument("--verify_only",  action="store_true")
-
-    args = parser.parse_args()
+    Path(cfg.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    set_seed(cfg.BENIGN_SEED)
+    df, h3k_arr, dnase_arr = load_all_data(cfg)
 
     if args.verify_only:
-        verify_data(Path(args.epi_dir))
-        return
+        print("\n  verify_only 완료."); return
 
-    seeds = [args.single_seed] if args.single_seed is not None else args.seeds
+    all_results = {}
+    for seed in cfg.SEEDS:
+        results = {}
+        if args.mode in ("train","all"):
+            _, val_m = run_train(cfg, df, h3k_arr, dnase_arr, seed)
+            results["val"] = val_m
+        if args.mode == "val":
+            results["val"]  = run_eval(cfg, df, h3k_arr, dnase_arr, seed, "val")
+        if args.mode in ("test","all"):
+            results["test"] = run_eval(cfg, df, h3k_arr, dnase_arr, seed, "test")
+        all_results[seed] = results
 
-    all_results = []
-    for seed in seeds:
-        result = run_single_seed(seed, args)
-        all_results.append(result)
-
-    # 멀티 시드 요약
-    if len(all_results) > 1:
-        auprcs = [r["macro_auprc"] for r in all_results if not np.isnan(r["macro_auprc"])]
-        print(f"\n{'='*60}")
-        print(f"  [Summary] Late Fusion | Seeds={seeds}")
-        print(f"  Macro AUPRC: {np.mean(auprcs):.4f} ± {np.std(auprcs):.4f}")
-        print(f"{'='*60}")
-
-        out = Path(args.output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        with open(out / "summary.json", "w") as f:
-            json.dump({
-                "seeds": seeds,
-                "mean_auprc": float(np.mean(auprcs)),
-                "std_auprc":  float(np.std(auprcs)),
-                "all_results": all_results,
-            }, f, indent=2)
-
+    if args.mode in ("test","all") and all_results:
+        print("\n" + "="*62 + "\n  최종 결과 (mean ± std)\n" + "="*62)
+        summary = {}
+        for tname in cfg.TISSUE_MAP.values():
+            vals = [r["test"][tname]["auprc"] for r in all_results.values()
+                    if "test" in r and tname in r["test"]]
+            if vals:
+                summary[tname] = {"mean": round(float(np.mean(vals)),4),
+                                  "std":  round(float(np.std(vals)), 4)}
+                print(f"  {tname:6s} AUPRC = {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+        macro_vals = [r["test"]["macro_auprc"] for r in all_results.values() if "test" in r]
+        if macro_vals:
+            summary["macro"] = {"mean": round(float(np.mean(macro_vals)),4),
+                                 "std":  round(float(np.std(macro_vals)), 4)}
+            print(f"  macro  AUPRC = {np.mean(macro_vals):.4f} ± {np.std(macro_vals):.4f}")
+        with open(Path(cfg.OUTPUT_DIR) / "final_summary.json", "w") as f:
+            json.dump({"mode": args.mode,
+                       "per_seed": {str(k): v for k, v in all_results.items()},
+                       "summary": summary}, f, indent=2, ensure_ascii=False)
 
 if __name__ == "__main__":
     main()
